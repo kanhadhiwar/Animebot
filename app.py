@@ -1,4 +1,4 @@
-# app.py (THE REAL, FINAL, CLEAN, EASY-TO-READ FULL CODE)
+# app.py (UPDATED FULL FIXED VERSION)
 
 import os
 import asyncio
@@ -7,6 +7,7 @@ import traceback
 import uvicorn
 import re
 import logging
+import urllib.parse   # <-- NEW FIX (URL ENCODE)
 from contextlib import asynccontextmanager
 
 from pyrogram import Client, filters, enums
@@ -20,21 +21,334 @@ from pyrogram import raw
 from pyrogram.session import Session, Auth
 import math
 
-# Project ki dusri files se important cheezein import karo
 from config import Config
 from database import db
 
-# =====================================================================================
-# --- SETUP: BOT, WEB SERVER, AUR LOGGING ---
-# =====================================================================================
+# ============================================================
+# BOT + LIFESPAN
+# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Yeh function bot ko web server ke saath start aur stop karta hai.
-    """
-    print("--- Lifespan: Server chalu ho raha hai... ---")
-    
+    print("--- Lifespan Startup ---")
+
+    await db.connect()
+
+    try:
+        await bot.start()
+        me = await bot.get_me()
+        Config.BOT_USERNAME = me.username
+        print(f"Bot @{Config.BOT_USERNAME} started.")
+
+        multi_clients[0] = bot
+        work_loads[0] = 0
+
+        await initialize_clients()
+
+        await bot.get_chat(Config.STORAGE_CHANNEL)
+        print("Storage channel OK.")
+
+    except Exception:
+        print(traceback.format_exc())
+
+    yield
+
+    print("Stopping bot...")
+    if bot.is_initialized:
+        await bot.stop()
+    print("Shutdown complete.")
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+class HideDLFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "GET /dl/" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(HideDLFilter())
+
+bot = Client(
+    "SimpleStreamBot",
+    api_id=Config.API_ID,
+    api_hash=Config.API_HASH,
+    bot_token=Config.BOT_TOKEN,
+    in_memory=True,
+)
+
+multi_clients = {}
+work_loads = {}
+class_cache = {}
+
+# ============================================================
+# MULTI CLIENT SETUP
+# ============================================================
+
+class TokenParser:
+    @staticmethod
+    def parse_from_env():
+        return {
+            i + 1: v for i, (k, v) in enumerate(
+                filter(lambda x: x[0].startswith("MULTI_TOKEN"), os.environ.items())
+            )
+        }
+
+async def start_client(client_id, token):
+    try:
+        client = await Client(
+            name=str(client_id),
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            bot_token=token,
+            no_updates=True,
+            in_memory=True
+        ).start()
+        multi_clients[client_id] = client
+        work_loads[client_id] = 0
+        print(f"Client {client_id} started.")
+    except Exception as e:
+        print(f"Error starting client {client_id}: {e}")
+
+async def initialize_clients():
+    tokens = TokenParser.parse_from_env()
+    if not tokens:
+        print("Single bot mode.")
+        return
+
+    await asyncio.gather(*[
+        start_client(i, t) for i, t in tokens.items()
+    ])
+
+    print(f"Total Clients: {len(multi_clients)}")
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_readable_file_size(size):
+    if not size:
+        return "0B"
+    labels = ["B", "KB", "MB", "GB"]
+    i = 0
+    while size >= 1024 and i < 3:
+        size /= 1024
+        i += 1
+    return f"{size:.2f} {labels[i]}"
+
+# ============================================================
+# BOT HANDLERS
+# ============================================================
+
+@bot.on_message(filters.command("start") & filters.private)
+async def start_cmd(_, message: Message):
+    user = message.from_user.first_name
+    text = f"Hello {user}, send any file to get a streaming link!"
+    await message.reply_text(text)
+
+
+@bot.on_message(filters.private & (filters.document | filters.video | filters.audio))
+async def file_handler(_, message: Message):
+    try:
+        sent = await message.copy(Config.STORAGE_CHANNEL)
+        unique_id = secrets.token_urlsafe(8)
+        await db.save_link(unique_id, sent.id)
+
+        verify = f"https://t.me/{Config.BOT_USERNAME}?start=verify_{unique_id}"
+        btn = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Get Link", url=verify)]]
+        )
+        await message.reply_text("File saved!", reply_markup=btn)
+
+    except Exception as e:
+        print(e)
+        await message.reply_text("Upload error.")
+
+
+# ============================================================
+# API ROUTES
+# ============================================================
+
+@app.get("/")
+async def home():
+    return {"status": "running"}
+
+
+@app.get("/api/file/{unique_id}")
+async def api_file(unique_id: str):
+    mid = await db.get_link(unique_id)
+    if not mid:
+        raise HTTPException(404, "Invalid Link ID")
+
+    bot0 = multi_clients.get(0)
+    msg = await bot0.get_messages(Config.STORAGE_CHANNEL, mid)
+
+    media = msg.document or msg.video or msg.audio
+    if not media:
+        raise HTTPException(404, "Media missing")
+
+    filename = media.file_name or "file"
+
+    # ---------------------------------------------------------
+    # FIX 1: URL Encode safe filename
+    # ---------------------------------------------------------
+    safe_file_name = urllib.parse.quote(filename)
+
+    # ---------------------------------------------------------
+    # FIX 2: Extract HASH for ?hash=
+    # ---------------------------------------------------------
+    try:
+        file_hash = media.file_id.split('-')[0]
+    except:
+        file_hash = "tg"
+
+    # Final streaming URL (WORKING FORMAT)
+    stream_url = f"{Config.BASE_URL}/dl/{mid}/{safe_file_name}?hash={file_hash}"
+
+    return {
+        "file_name": filename,
+        "file_size": get_readable_file_size(media.file_size),
+        "is_media": (media.mime_type or "").startswith(("video", "audio")),
+        "direct_dl_link": stream_url,
+        "mx_player_link": f"intent:{stream_url}#Intent;action=android.intent.action.VIEW;type={media.mime_type};end",
+        "vlc_player_link": f"intent:{stream_url}#Intent;action=android.intent.action.VIEW;type={media.mime_type};package=org.videolan.vlc;end"
+    }
+
+
+# ============================================================
+# BYTE STREAMER (NO CHANGE)
+# ============================================================
+
+class ByteStreamer:
+    def __init__(self, client: Client):
+        self.client = client
+
+    @staticmethod
+    async def get_location(f: FileId):
+        return raw.types.InputDocumentFileLocation(
+            id=f.media_id,
+            access_hash=f.access_hash,
+            file_reference=f.file_reference,
+            thumb_size=f.thumbnail_size,
+        )
+
+    async def yield_file(self, f: FileId, cid: int, offset: int, fcut: int, lcut: int, parts: int, chunk: int):
+        c = self.client
+        work_loads[cid] += 1
+
+        ms = c.media_sessions.get(f.dc_id)
+        if ms is None:
+            if f.dc_id != await c.storage.dc_id():
+                ak = await Auth(c, f.dc_id, await c.storage.test_mode()).create()
+                ms = Session(c, f.dc_id, ak, await c.storage.test_mode(), is_media=True)
+                await ms.start()
+
+                ex = await c.invoke(raw.functions.auth.ExportAuthorization(dc_id=f.dc_id))
+                await ms.invoke(raw.functions.auth.ImportAuthorization(id=ex.id, bytes=ex.bytes))
+
+            else:
+                ms = c.session
+
+            c.media_sessions[f.dc_id] = ms
+
+        loc = await self.get_location(f)
+        p = 1
+
+        try:
+            while p <= parts:
+                r = await ms.invoke(raw.functions.upload.GetFile(location=loc, offset=offset, limit=chunk))
+                if isinstance(r, raw.types.upload.File):
+                    chunk_bytes = r.bytes
+                    if not chunk_bytes:
+                        break
+
+                    if parts == 1:
+                        yield chunk_bytes[fcut:lcut]
+                    elif p == 1:
+                        yield chunk_bytes[fcut:]
+                    elif p == parts:
+                        yield chunk_bytes[:lcut]
+                    else:
+                        yield chunk_bytes
+
+                    offset += chunk
+                    p += 1
+                else:
+                    break
+
+        finally:
+            work_loads[cid] -= 1
+
+
+@app.get("/dl/{mid}/{fname}")
+async def stream(mid: int, fname: str, request: Request):
+    if not work_loads:
+        raise HTTPException(503)
+
+    cid = min(work_loads, key=work_loads.get)
+    c = multi_clients.get(cid)
+
+    try:
+        msg = await c.get_messages(Config.STORAGE_CHANNEL, mid)
+        media = msg.document or msg.video or msg.audio
+        if not media:
+            raise HTTPException(404)
+
+        file_id = FileId.decode(media.file_id)
+        size = media.file_size
+
+        r = request.headers.get("Range")
+        fb, ub = 0, size - 1
+
+        if r:
+            parts = r.replace("bytes=", "").split("-")
+            fb = int(parts[0])
+            if parts[1]:
+                ub = int(parts[1])
+
+        if ub >= size or fb < 0:
+            raise HTTPException(416)
+
+        length = ub - fb + 1
+        chunk = 1024 * 1024
+        offset = (fb // chunk) * chunk
+        fcut = fb - offset
+        lcut = (ub % chunk) + 1
+        count = math.ceil(length / chunk)
+
+        bs = class_cache.get(c) or ByteStreamer(c)
+        class_cache[c] = bs
+
+        body = bs.yield_file(file_id, cid, offset, fcut, lcut, count, chunk)
+
+        headers = {
+            "Content-Type": media.mime_type,
+            "Content-Length": str(length),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{media.file_name}"'
+        }
+
+        if r:
+            headers["Content-Range"] = f"bytes {fb}-{ub}/{size}"
+            return StreamingResponse(body, status_code=206, headers=headers)
+
+        return StreamingResponse(body, headers=headers)
+
+    except Exception:
+        print(traceback.format_exc())
+        raise HTTPException(500)
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))    
     await db.connect()
     
     try:
